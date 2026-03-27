@@ -111,6 +111,25 @@ def _html_code(value: str) -> str:
     return f"<code>{escape(value)}</code>"
 
 
+def _normalize_cookie_string(cookie: str) -> str:
+    parts: list[str] = []
+    for line in cookie.replace("\ufeff", "").splitlines():
+        line = line.strip().strip(";")
+        if not line:
+            continue
+        parts.extend(part.strip() for part in line.split(";") if part.strip())
+    return "; ".join(parts)
+
+
+def _decode_text_payload(data: bytes) -> str | None:
+    for encoding in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
 # ── /start ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -146,7 +165,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "2. Нажмите F12 → Application → Cookies → www.olx.ro\n"
         "3. Скопируйте всё в формате `name=value; name2=value2`\n"
         "   Или используйте расширение *Cookie-Editor* / *EditThisCookie*\n"
-        "4. Отправьте строку боту через /setcookie\n\n"
+        "4. Отправьте строку боту через /setcookie\n"
+        "   Или отправьте `.txt`-файл с cookies\n\n"
         "*Форматы прокси:*\n"
         "`http://host:port`\n"
         "`http://user:pass@host:port`\n"
@@ -200,49 +220,87 @@ async def cmd_setcookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return IDLE
 
     if context.args:
-        await _handle_cookie(update, " ".join(context.args))
-        return IDLE
+        if await _handle_cookie(update, " ".join(context.args)):
+            return IDLE
+        return AWAITING_COOKIE
 
     await update.message.reply_text(
         "🍪 *Установка кук OLX.ro*\n\n"
         "Отправьте строку кук в формате:\n"
         "`name1=value1; name2=value2; ...`\n\n"
+        "Или отправьте `.txt`-файл с этой строкой\n\n"
         "Как получить:\n"
         "• F12 → Application → Cookies → www.olx.ro\n"
         "• Или расширение *Cookie-Editor* → Export as Header String\n\n"
-        "Отправьте строку или /cancel для отмены:",
+        "Отправьте строку, `.txt`-файл или /cancel для отмены:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
     return AWAITING_COOKIE
 
 
-async def _handle_cookie(update: Update, cookie: str) -> None:
-    cookie = cookie.strip()
+async def _handle_cookie(update: Update, cookie: str) -> bool:
+    cookie = _normalize_cookie_string(cookie)
     if not cookie or "=" not in cookie:
         await update.message.reply_text(
             "⚠️ Некорректный формат. Пример:\n"
             "`sessionid=abc123; csrftoken=xyz`\n\nПопробуйте ещё раз:",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return
+        return False
     storage.set_cookie(update.effective_user.id, cookie)
     await update.message.reply_text(
         "✅ Куки сохранены!\n\nПроверьте авторизацию: /checkauth",
         reply_markup=main_keyboard(),
     )
+    return True
 
 
 async def received_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if not text or "=" not in text:
+    if await _handle_cookie(update, text):
+        return IDLE
+    return AWAITING_COOKIE
+
+
+async def received_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    document = update.message.document
+    filename = (document.file_name or "").lower()
+    mime_type = document.mime_type or ""
+
+    if not (filename.endswith(".txt") or mime_type == "text/plain"):
         await update.message.reply_text(
-            "⚠️ Некорректный формат. Пример:\n`sessionid=abc; token=xyz`\n\nПовторите:",
-            parse_mode=ParseMode.MARKDOWN,
+            "⚠️ Поддерживаются только TXT-файлы с cookies. "
+            "Или вставьте строку вручную."
         )
         return AWAITING_COOKIE
-    await _handle_cookie(update, text)
-    return IDLE
+
+    if document.file_size and document.file_size > 64 * 1024:
+        await update.message.reply_text(
+            "⚠️ TXT-файл слишком большой. Пришлите небольшой файл со строкой cookies."
+        )
+        return AWAITING_COOKIE
+
+    try:
+        telegram_file = await document.get_file()
+        payload = bytes(await telegram_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download cookie TXT")
+        await update.message.reply_text(
+            "❌ Не удалось скачать файл из Telegram. Попробуйте ещё раз."
+        )
+        return AWAITING_COOKIE
+
+    text = _decode_text_payload(payload)
+    if text is None:
+        await update.message.reply_text(
+            "⚠️ Не удалось прочитать TXT-файл. Сохраните его в UTF-8 или отправьте строку вручную."
+        )
+        return AWAITING_COOKIE
+
+    if await _handle_cookie(update, text):
+        return IDLE
+    return AWAITING_COOKIE
 
 
 # ── /setproxy ────────────────────────────────────────────────────────────────
@@ -498,6 +556,7 @@ def main() -> None:
             IDLE: shared_cmds
             + [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idle_text)],
             AWAITING_COOKIE: [
+                MessageHandler(filters.Document.ALL, received_cookie_file),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_cookie),
                 CommandHandler("cancel", cmd_cancel),
             ],
