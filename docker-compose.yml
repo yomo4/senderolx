@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  olx-bot:
+    build: .
+    image: olx-sender-bot:latest
+    container_name: olx_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Persist user data (cookies, proxy settings) and logs between restarts
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
